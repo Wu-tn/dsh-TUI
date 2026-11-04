@@ -371,6 +371,29 @@ export function codeLanguageTag(token: Tokens.Code): string {
   return (token.lang ?? '').trim().split(/\s+/)[0] ?? ''
 }
 
+// ---- highlighted-block cache ----
+//
+// cli-highlight re-runs highlight.js on every call, and virtualization
+// unmounts code-heavy rows: scrolling back re-highlighted them (measured
+// 2.6ms / 6.5ms / 21ms for 40 / 120 / 300 lines). Highlighted output is a
+// pure function of (theme, language, source), so keep a bounded cache. The
+// theme object identity is the key - buildSyntaxTheme bakes its palette.
+const CODE_CACHE_MAX_ENTRIES = 128
+const CODE_CACHE_MAX_CHARS = 1_000_000
+const CODE_CACHE_MAX_SOURCE = 50_000
+const codeCache = new Map<string, string>()
+let codeCacheChars = 0
+const themeIds = new WeakMap<object, number>()
+let nextThemeId = 1
+
+function themeKey(theme: object): number {
+  const known = themeIds.get(theme)
+  if (known !== undefined) return known
+  const id = nextThemeId++
+  themeIds.set(theme, id)
+  return id
+}
+
 /**
  * Highlighted (or plain) body of a fenced code block, with trailing blank
  * lines stripped. Shared by the ANSI fence and CodeBlockFrame so both
@@ -398,11 +421,35 @@ export function formatCodeBody(token: Tokens.Code, highlight: CliHighlight | nul
       }
     }
     const theme = getActiveTheme()
+    const cacheable = token.text.length <= CODE_CACHE_MAX_SOURCE
+    const key = cacheable ? `${themeKey(theme)}\0${language}\0${token.text}` : ''
+    if (cacheable) {
+      const cached = codeCache.get(key)
+      if (cached !== undefined) {
+        codeCache.delete(key)
+        codeCache.set(key, cached)
+        return cached
+      }
+    }
     noteCodeHighlight()
     const highlighted = highlight.highlight(token.text, { language, theme: buildSyntaxTheme(theme) })
     // Strip ALL trailing newlines: trailing blank lines would otherwise leak
     // a stray blank line at the end of the block.
-    return highlighted.replace(/\n+$/, '') || plain
+    const result = highlighted.replace(/\n+$/, '') || plain
+    if (cacheable) {
+      while (
+        codeCache.size >= CODE_CACHE_MAX_ENTRIES ||
+        codeCacheChars + key.length > CODE_CACHE_MAX_CHARS
+      ) {
+        const oldest = codeCache.keys().next().value
+        if (oldest === undefined) break
+        codeCache.delete(oldest)
+        codeCacheChars -= oldest.length
+      }
+      codeCache.set(key, result)
+      codeCacheChars += key.length
+    }
+    return result
   } catch (error) {
     logForDebugging(
       `Code highlighting threw, degrading the block to plaintext: ${String(error)}`,

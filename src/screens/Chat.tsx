@@ -75,6 +75,7 @@ import { StarPrompt, WhaleCouponPrompt, type StarAttempt } from '../components/S
 import type { WhaleCouponStore } from '../dsh-adapter/oauth/bonus.js'
 import { dueStarModal, markStarAsked, pendingStarMilestone, readUsage, STAR_MILESTONES } from '../usageStats.js'
 import { TimelineRail } from '../components/TimelineRail.js'
+import { RAIL_WIDTH } from '../ink/timeline-rail.js'
 import { ScrollbarGutter } from '../components/ScrollbarGutter.js'
 import type { TimelineSnapshot } from '../ink/timeline-rail.js'
 import { normalizeScrollGutter } from '../tuiDisplayPrefs.js'
@@ -4688,6 +4689,7 @@ export function Chat({
   // 所有显式下传的宽度（gutter / 图片预览区 / wake 条）都改用它；转录
   // 子树则经 SidePanelLayout 的 TerminalSizeContext 覆盖自动拿到。
   const chatColumns = sidePanel.chatColumns
+  const gutter = normalizeScrollGutter(channel.scrollGutter)
   const wakeWidth = miniWakeWidth(chatColumns)
   const panelPickerRows = usePanelPickerRows(sidePanel)
   const wakeBand = React.useMemo(
@@ -7161,7 +7163,18 @@ export function Chat({
           and cards keep the content column). No explicit width: cross-axis
           stretch with the margin yields exactly content+margin. */}
       <Box flexDirection="row" flexGrow={1} flexShrink={1} marginRight={sidePanel.split ? 0 : -pageInsetX}>
-        <ScrollBox ref={setHandle} flexDirection="column" flexGrow={1} flexShrink={1} stickyScroll>
+        <ScrollBox
+          ref={setHandle}
+          flexDirection="column"
+          flexGrow={1}
+          flexShrink={1}
+          stickyScroll
+          // Reserve the gutter's columns without making it a flex sibling:
+          // a second flow child in this row sent Yoga down a much slower
+          // layout path on every streaming commit (measured 29 vs 58 fps in
+          // the scroll harness). The rail itself is absolute, below.
+          paddingRight={gutter === 'hidden' ? 0 : RAIL_WIDTH}
+        >
         <LogoHeader
           key={logoNonce}
           model={channel.modelDisplay ?? channel.model}
@@ -7240,30 +7253,28 @@ export function Chat({
           onWatchJobOutput={watchJobOutput}
         />
         </ScrollBox>
-        {(() => {
+        {gutter === 'hidden' ? null : (
           // Gutter mode (settings `dsh-tui.scrollGutter`): the timeline
           // rail (default), the proportional scrollbar, or nothing. The
-          // slot keeps its 2 columns in both rendered modes (Qwen's
-          // permanent-gutter rule — an appearing/disappearing gutter
-          // changes the transcript width and rewraps everything).
-          const gutter = normalizeScrollGutter(channel.scrollGutter)
-          if (gutter === 'hidden') return null
-          if (gutter === 'scrollbar') {
-            return <ScrollbarGutter handle={handle} terminalWidth={chatColumns} />
-          }
-          return (
-            <TimelineRail
-              handle={handle}
-              turns={timeline.turns}
-              activeId={timeline.activeId}
-              upId={timeline.upId}
-              downId={timeline.downId}
-              terminalWidth={chatColumns}
-              hoverEnabled={!promptSelectionActive}
-              onRevealTurn={revealAndSeekRow}
-            />
-          )
-        })()}
+          // columns are reserved by ScrollBox's paddingRight; the gutter is
+          // an absolute overlay so the transcript row keeps ONE flow child.
+          <Box position="absolute" right={0} top={0} bottom={0} width={RAIL_WIDTH} flexShrink={0}>
+            {gutter === 'scrollbar'
+              ? <ScrollbarGutter handle={handle} terminalWidth={chatColumns} />
+              : (
+                <TimelineRail
+                  handle={handle}
+                  turns={timeline.turns}
+                  activeId={timeline.activeId}
+                  upId={timeline.upId}
+                  downId={timeline.downId}
+                  terminalWidth={chatColumns}
+                  hoverEnabled={!promptSelectionActive}
+                  onRevealTurn={revealAndSeekRow}
+                />
+              )}
+          </Box>
+        )}
         {!promptEditorOpen && imagePreviewNode}
       </Box>
       {/* Bottom chrome (pill, spinners, dialogs, prompt, statusline): never

@@ -156,6 +156,64 @@ function isMermaidToken(token: Token): token is Tokens.Code {
   return token.type === 'code' && isMermaidLang((token as Tokens.Code).lang)
 }
 
+// ---- rendered-node cache ----
+//
+// Virtualization unmounts rows, so React.memo/useMemo die with the mount and
+// a scrolled-back row re-runs token→ANSI→highlight. Markdown output is a pure
+// function of (stripped source, palette, dim, inline-math, whether the
+// highlighter is loaded), so keep the element array across mounts. Elements
+// are immutable descriptors: reusing the same array in a new mount is safe.
+// Streaming tails pass cacheTokens=false and never enter this cache.
+const NODE_CACHE_MAX_ENTRIES = 64
+const NODE_CACHE_CHAR_BUDGET = 512_000
+const NODE_CACHE_MAX_SOURCE = 50_000
+const nodeCache = new Map<string, React.ReactNode[]>()
+let nodeCacheChars = 0
+const paletteIds = new WeakMap<object, number>()
+let nextPaletteId = 1
+
+function paletteKey(palette: object): number {
+  const known = paletteIds.get(palette)
+  if (known !== undefined) return known
+  const id = nextPaletteId++
+  paletteIds.set(palette, id)
+  return id
+}
+
+function nodeCacheKey(
+  source: string,
+  palette: object,
+  dimColor: boolean,
+  inlineMathImages: boolean,
+  mathRendering: string,
+  highlighted: boolean,
+): string {
+  return `${paletteKey(palette)}|${dimColor ? 1 : 0}|${inlineMathImages ? 1 : 0}|${mathRendering}|${highlighted ? 1 : 0}|${source}`
+}
+
+function takeCachedNodes(key: string): React.ReactNode[] | undefined {
+  const hit = nodeCache.get(key)
+  if (hit === undefined) return undefined
+  nodeCache.delete(key)
+  nodeCache.set(key, hit)
+  return hit
+}
+
+function storeCachedNodes(key: string, nodes: React.ReactNode[]): void {
+  const sourceChars = key.length
+  while (
+    nodeCache.size >= NODE_CACHE_MAX_ENTRIES ||
+    nodeCacheChars + sourceChars > NODE_CACHE_CHAR_BUDGET
+  ) {
+    const oldest = nodeCache.keys().next().value
+    if (oldest === undefined) break
+    nodeCache.delete(oldest)
+    nodeCacheChars -= oldest.length
+  }
+  nodeCache.set(key, nodes)
+  nodeCacheChars += sourceChars
+}
+
 /**
  * 把 lexer 产出的 token 列表转成 React 节点序列：table、mermaid 与公式块
  * 独立渲染，其余 token 的 ANSI 文本按完整块分批拼接，只去整段首尾空白。
@@ -256,6 +314,12 @@ function renderTokensToNodes(
   return nodes
 }
 
+// The highlighter is a process-wide singleton loaded once; starting each
+// mount from the resolved value avoids the extra no-highlight render that
+// every remount used to pay (and whose output could never be cached).
+let resolvedHighlight: CliHighlight | null = null
+let highlightLoaded = false
+
 /**
  * 混合渲染 Markdown 内容：表格用带边框的 flexbox 组件，其余内容由
  * formatToken 生成 ANSI 字符串放入 Text。高亮对象异步就绪后自动刷新。
@@ -268,7 +332,7 @@ function renderTokensToNodes(
  * of CPU in streaming profiles).
  */
 function MarkdownImpl({ children, dimColor = false, cacheTokens = true, inlineMathImages = true, stripPromptTags = true }: Props): React.ReactNode {
-  const [highlight, setHighlight] = React.useState<CliHighlight | null>(null)
+  const [highlight, setHighlight] = React.useState<CliHighlight | null>(() => (highlightLoaded ? resolvedHighlight : null))
   // Inline math is baked into the ANSI text, so the switch must invalidate
   // the memo below (MathBlock nodes subscribe on their own).
   const mathRendering = React.useSyncExternalStore(subscribeMathRendering, getMathRendering)
@@ -282,6 +346,8 @@ function MarkdownImpl({ children, dimColor = false, cacheTokens = true, inlineMa
   React.useEffect(() => {
     let mounted = true
     void getCliHighlightPromise().then((loaded) => {
+      resolvedHighlight = loaded
+      highlightLoaded = true
       if (mounted) setHighlight(loaded)
     })
     return () => {
@@ -293,12 +359,27 @@ function MarkdownImpl({ children, dimColor = false, cacheTokens = true, inlineMa
 
   const renderedNodes = React.useMemo(() => {
     const source = stripPromptTags ? stripPromptXMLTags(children) : children
+    // Dimmed text (thinking) cannot dim an image, so it keeps Unicode.
+    const effectiveInlineMath = inlineMathImages && mathRendering === 'image' && !dimColor
+    const cacheable = cacheTokens && source.length <= NODE_CACHE_MAX_SOURCE
+    if (cacheable) {
+      const key = nodeCacheKey(source, palette, dimColor, effectiveInlineMath, mathRendering, highlight !== null)
+      const cached = takeCachedNodes(key)
+      if (cached !== undefined) return cached
+      const nodes = renderTokensToNodes(
+        lexWithCache(source, cacheTokens),
+        highlight,
+        dimColor,
+        effectiveInlineMath,
+      )
+      storeCachedNodes(key, nodes)
+      return nodes
+    }
     return renderTokensToNodes(
       lexWithCache(source, cacheTokens),
       highlight,
       dimColor,
-      // Dimmed text (thinking) cannot dim an image, so it keeps Unicode.
-      inlineMathImages && mathRendering === 'image' && !dimColor,
+      effectiveInlineMath,
     )
   }, [children, dimColor, highlight, cacheTokens, mathRendering, inlineMathImages, palette, stripPromptTags])
 

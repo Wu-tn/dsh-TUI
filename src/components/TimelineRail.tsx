@@ -57,7 +57,7 @@ type Hover =
  * NoSelect so click-drag text selection never picks up its glyphs, and
  * the wheel scrolls the transcript (the rail has no scroll of its own).
  */
-export function TimelineRail({
+function TimelineRailImpl({
   handle,
   turns,
   activeId,
@@ -89,7 +89,6 @@ export function TimelineRail({
    */
   onRevealTurn: (rowId: number) => void
 }): React.ReactNode {
-  const [, setTick] = React.useState(0)
   const [hover, setHover] = React.useState<Hover>(null)
   // Dwell-gated preview card: the card pops only after the pointer RESTS
   // on a tick for HOVER_DWELL_MS. Sweeping the rail fires enter/leave per
@@ -116,17 +115,24 @@ export function TimelineRail({
   React.useEffect(() => () => {
     if (dwellTimerRef.current !== null) clearTimeout(dwellTimerRef.current)
   }, [])
+  // Scroll no longer re-renders the rail: MessageList owns the commit and
+  // reports a fresh timeline snapshot when the active turn changes. A scroll
+  // still dismisses an open hover card, but only while one exists — the
+  // subscription does not schedule a commit for ordinary wheel movement.
+  const hoverRef = React.useRef<Hover>(null)
+  hoverRef.current = hover
+  const cardIndexRef = React.useRef<number | null>(null)
+  cardIndexRef.current = cardIndex
   React.useEffect(() => {
     if (!handle) return
     return handle.subscribe(() => {
-      setTick(t => t + 1)
       // A scroll (wheel over the rail, tick/chevron jump, header click)
       // slides the tick window under a STATIONARY pointer — without this,
       // the hover card keeps re-narrating whatever turn now sits under the
       // pointer cell, flapping previews across turns every frame (reads as
       // ghosting). OpenCode's modality rule: only a real mouse move may
       // re-enter hover; Grok likewise clears the hover popup on tick click.
-      // setHover(null) on an already-null hover is a React no-op.
+      if (hoverRef.current === null && cardIndexRef.current === null) return
       setHover(null)
       clearDwell()
     })
@@ -312,3 +318,43 @@ export function TimelineRail({
     </NoSelect>
   )
 }
+
+/**
+ * Value-compare the rail's inputs: a streaming delta rebuilds MessageList's
+ * turns array with the same ids/tops/previews on almost every commit. The
+ * rail is a pure function of those values plus the viewport width and the
+ * active targets, so re-rendering it per delta only re-runs Yoga on an
+ * unchanged 2-column subtree. onRevealTurn is deliberately not compared: it
+ * is a fresh closure per Chat render whose only state is `showAllMessages`,
+ * and calling it again for an already-revealed row is idempotent.
+ */
+function timelineRailPropsEqual(
+  prev: React.ComponentProps<typeof TimelineRailImpl>,
+  next: React.ComponentProps<typeof TimelineRailImpl>,
+): boolean {
+  if (
+    prev.handle !== next.handle ||
+    prev.terminalWidth !== next.terminalWidth ||
+    prev.hoverEnabled !== next.hoverEnabled ||
+    prev.activeId !== next.activeId ||
+    prev.upId !== next.upId ||
+    prev.downId !== next.downId
+  ) return false
+  const a = prev.turns
+  const b = next.turns
+  if (a === b) return true
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i]!
+    const y = b[i]!
+    if (x.id !== y.id || x.top !== y.top || x.folded !== y.folded) return false
+    // Preview is hover-card content, not layout. The LIVE turn's preview
+    // changes on every streamed chunk; comparing it re-rendered the whole
+    // rail per delta. The card reads the preview from the turn it points at,
+    // and a genuine geometry/target change re-renders with a fresh preview.
+    if (i !== a.length - 1 && x.preview !== y.preview) return false
+  }
+  return true
+}
+
+export const TimelineRail = React.memo(TimelineRailImpl, timelineRailPropsEqual)

@@ -99,6 +99,44 @@ function isTurnRow(row: ChatRow): boolean {
   return row.kind === 'user' && row.label !== 'team-message'
 }
 
+/** Indexes of the turns the rail and the sticky header name. Pure and
+ *  shared by render and the scroll probe, so the probe can decide whether a
+ *  scroll moved any target without re-running the whole MessageList. */
+type TimelineTargets = {
+  active: number | null
+  pinned: number | null
+  up: number | null
+  down: number | null
+}
+
+function deriveTimelineTargets(
+  turns: ReadonlyArray<TimelineTurn>,
+  viewTop: number,
+  maxScroll: number,
+): TimelineTargets {
+  let active: number | null = null
+  let up: number | null = null
+  let down: number | null = null
+  for (let i = 0; i < turns.length; i++) {
+    const turn = turns[i]!
+    if (turn.folded === true) {
+      // Above the fold => strictly above the viewport: a legal up target.
+      up = i
+      continue
+    }
+    if (turn.top <= viewTop) active = i
+    if (turn.top < viewTop) up = i
+    if (down === null && turn.top > viewTop && turn.top <= maxScroll) down = i
+  }
+  if (turns.length > 0 && active === null) active = 0
+  let pinned: number | null = null
+  if (active !== null) {
+    const turn = turns[active]!
+    if (turn.folded === true || turn.top < viewTop) pinned = active
+  }
+  return { active, pinned, up, down }
+}
+
 /** The sender a team-message row shows (empty when the event named none);
  *  undefined for every other row, which renders as the human's prompt. */
 function teamSenderOf(row: ChatRow): string | undefined {
@@ -852,6 +890,11 @@ export function MessageList({
   const measureTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   const [, setMeasureTick] = React.useState(0)
   const [, setScrollTick] = React.useState(0)
+  /** Rebuilt every render: true when the viewport still sits inside the
+   *  committed mount window and no turn target changed. ScrollBox already
+   *  moves content imperatively; only a window extension, a sticky flip, a
+   *  timeline target, or the unseen pill needs a React commit. */
+  const scrollProbeRef = React.useRef<(() => boolean) | null>(null)
   React.useEffect(() => () => {
     if (measureTimerRef.current !== null) {
       clearTimeout(measureTimerRef.current)
@@ -959,7 +1002,11 @@ export function MessageList({
   // window follows the viewport.
   React.useEffect(() => {
     if (!scrollHandle) return
-    const tick = (): void =>{  setScrollTick(t => t + 1) }
+    const tick = (): void => {
+      const probe = scrollProbeRef.current
+      if (probe !== null && !probe()) return
+      setScrollTick(t => t + 1)
+    }
     return scrollHandle.subscribe(tick)
   }, [scrollHandle])
 
@@ -1326,24 +1373,11 @@ export function MessageList({
     // the top row, and naming it would make ▼ repeat itself forever.
     const viewTop = scrollTop + pending
     const maxScroll = Math.max(0, (scrollHandle?.getScrollHeight() ?? 0) - viewport)
-    for (let i = 0; i < timelineTurns.length; i++) {
-      const t = timelineTurns[i]!
-      if (t.folded === true) {
-        // Above the fold ⇒ strictly above the viewport: a legal ▲ target.
-        upTurnIndex = i
-        continue
-      }
-      if (t.top <= viewTop) activeTurnIndex = i
-      if (t.top < viewTop) upTurnIndex = i
-      if (downTurnIndex === null && t.top > viewTop && t.top <= maxScroll) {
-        downTurnIndex = i
-      }
-    }
-    if (timelineTurns.length > 0 && activeTurnIndex === null) activeTurnIndex = 0
-    if (activeTurnIndex !== null) {
-      const active = timelineTurns[activeTurnIndex]!
-      if (active.folded === true || active.top < viewTop) pinnedTurnIndex = activeTurnIndex
-    }
+    const targets = deriveTimelineTargets(timelineTurns, viewTop, maxScroll)
+    activeTurnIndex = targets.active
+    pinnedTurnIndex = targets.pinned
+    upTurnIndex = targets.up
+    downTurnIndex = targets.down
   }
   const timeline: TimelineSnapshot = {
     turns: timelineTurns,
@@ -1380,6 +1414,55 @@ export function MessageList({
     lastTimelineReportRef.current = timeline
     onTimeline?.(timeline)
   })
+
+  // Scroll-only wakeups stay out of React while the viewport is inside the
+  // committed window: ScrollBox already moved scrollTop and the renderer
+  // paints from it, so re-rendering the transcript here only re-runs Yoga
+  // (measured as the scroll/stream stall). Commit when the window must grow,
+  // when sticky flips, when a rail/pinned target changes, or when the unseen
+  // pill count changes — everything else is handled by the next real commit.
+  {
+    const committedTop = base + (offsets[start] ?? 0)
+    const committedBottom =
+      end < visibleRows.length ? base + (offsets[end] ?? 0) : base + total
+    scrollProbeRef.current = () => {
+      const handle = scrollHandle
+      if (!handle) return true
+      const nextSticky = handle.isSticky()
+      if (nextSticky !== sticky) return true
+      const nextScrollTop = handle.getScrollTop()
+      const nextPending = handle.getPendingDelta()
+      const nextViewport = handle.getViewportHeight()
+      if (!nextSticky) {
+        const margin = Math.max(OVERSCAN_LINES, Math.min(nextViewport, termRows) / 2)
+        const projectedTop = Math.min(nextScrollTop, nextScrollTop + nextPending)
+        const projectedBottom = Math.max(nextScrollTop, nextScrollTop + nextPending) + nextViewport
+        if (start > 0 && projectedTop < committedTop + margin) return true
+        if (end < visibleRows.length && projectedBottom > committedBottom - margin) return true
+      }
+      const nextViewTop = nextScrollTop + nextPending
+      const nextMaxScroll = Math.max(0, handle.getScrollHeight() - nextViewport)
+      const nextTargets = deriveTimelineTargets(timelineTurns, nextViewTop, nextMaxScroll)
+      if (
+        nextTargets.active !== activeTurnIndex ||
+        nextTargets.pinned !== pinnedTurnIndex ||
+        nextTargets.up !== upTurnIndex ||
+        nextTargets.down !== downTurnIndex
+      ) return true
+      if (newSinceRowId !== null && newSinceRowId !== undefined) {
+        const firstNew = visibleRows.findIndex(row => row.id > newSinceRowId)
+        if (firstNew !== -1) {
+          const seenBottom = nextScrollTop + nextViewport - base
+          let nextUnseen = 0
+          for (let i = firstNew; i < visibleRows.length; i++) {
+            if (offsets[i]! >= seenBottom) nextUnseen++
+          }
+          if (nextUnseen !== unseenCount) return true
+        }
+      }
+      return false
+    }
+  }
 
   // Scroll anchoring, commit half of the render-time pass above.
   // Post-commit: measure mounted rows, derive the content-space base from
