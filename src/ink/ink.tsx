@@ -15,9 +15,9 @@ import { format } from 'util';
 import { colorize } from './colorize.js';
 import App from './components/App.js';
 import type { CursorDeclaration, CursorDeclarationSetter } from './components/CursorDeclarationContext.js';
-import { FRAME_INTERVAL_MS, PTY_BACKLOG_BYTES } from './constants.js';
+import { FRAME_INTERVAL_MS, PTY_BACKLOG_BYTES, PTY_PAINT_GATE_BYTES } from './constants.js';
 import * as dom from './dom.js';
-import { beginGeometryFrame, endGeometryFrame, GEOMETRY_TRACE_ENABLED, noteFrameCause } from './geometry-trace.js';
+import { beginGeometryFrame, endGeometryFrame, GEOMETRY_TRACE_ENABLED, noteAuxNumber, noteFrameCause } from './geometry-trace.js';
 import { callWithUpdateOverflowGuard, installNestedUpdateOverflowProcessGuard } from './update-overflow-guard.js';
 import { KeyboardEvent } from './events/keyboard-event.js';
 import type { DragEvent } from './events/drag-event.js';
@@ -165,6 +165,21 @@ export default class Ink {
   private backFrame: Frame;
   private lastPoolResetTime = performance.now();
   private drainTimer: ReturnType<typeof setTimeout> | null = null;
+  // PTY paint gate. A terminal that stops consuming (a backgrounded
+  // VS Code window pauses the pty) makes every write buffer in this
+  // process; painting through that is what froze the editor's renderer
+  // for tens of seconds on refocus. When writableLength exceeds
+  // PTY_PAINT_GATE_BYTES the frame is dropped entirely — the screen is a
+  // pure function of the tree, and frontFrame only advances on a painted
+  // frame, so the first frame after 'drain' diffs against what the
+  // terminal actually holds.
+  private paintDeferred = false;
+  private drainWakeArmed = false;
+  /** Frames dropped by the gate since process start (geometry-trace aux). */
+  private backpressureDrops = 0;
+  // Set while the exit funnel paints its final frame: the gate must never
+  // swallow it, or the terminal keeps the pre-exit screen.
+  private bypassPaintGate = false;
   // Every scheduled microtask carries the generation that created it. Immediate
   // renders invalidate older trailing work before it can append an old frame.
   private renderGeneration = 0;
@@ -731,9 +746,51 @@ export default class Ink {
     this.drainTimer = setTimeout(this.renderNow, FRAME_INTERVAL_MS >> 2);
   }
 
+  /**
+   * Wake the frame loop when stdout has flushed enough to paint again.
+   *
+   * One listener at a time: a deferred frame re-arms on every dropped paint,
+   * and stacking `once('drain')` handlers would fan one drain event into N
+   * redundant renders. The retry is driven by the terminal, not a timer —
+   * a timer would restart the write flood the gate just stopped.
+   */
+  private armDrainWake(): void {
+    if (this.drainWakeArmed) return;
+    const stdout = this.options.stdout;
+    if (typeof stdout.once !== 'function') return;
+    this.drainWakeArmed = true;
+    stdout.once('drain', this.handleDrainWake);
+  }
+
+  private handleDrainWake = (): void => {
+    this.drainWakeArmed = false;
+    if (!this.paintDeferred || this.isUnmounted || this.isPaused) return;
+    this.paintDeferred = false;
+    this.scheduleRender();
+  };
+
   onRender() {
     if (this.isUnmounted || this.isPaused) {
       return;
+    }
+    // PTY paint gate — must run BEFORE anything consumes one-shot paint
+    // flags (needsSurfaceRepaint / needsEraseBeforePaint / scrollDrainPending):
+    // a deferred frame has painted nothing, so those flags have to survive
+    // for the frame that actually lands. Returning here also leaves
+    // frontFrame/backFrame untouched, which is what keeps the post-drain
+    // diff honest. See PTY_PAINT_GATE_BYTES for the field failure.
+    if (!this.bypassPaintGate) {
+      const inFlight = (this.options.stdout as { writableLength?: number }).writableLength;
+      if (typeof inFlight === 'number' && inFlight > PTY_PAINT_GATE_BYTES) {
+        this.paintDeferred = true;
+        // Counted as aux, not as a frame cause: this frame never begins, so
+        // noteFrameCause would attribute it to the NEXT frame's trace and
+        // read as "that frame was dropped", which it was not.
+        this.backpressureDrops += 1;
+        noteAuxNumber('backpressureDrops', this.backpressureDrops);
+        this.armDrainWake();
+        return;
+      }
     }
     if (this.needsSurfaceRepaint) {
       this.needsSurfaceRepaint = false;
@@ -2861,7 +2918,10 @@ export default class Ink {
     // throw (agent still working at the exact exit moment). It must NOT
     // skip the synchronous cleanup block below — a skipped DISABLE_*
     // leaves mouse reporting on past process exit, and the shell echoes
-    // SGR garbage for every click/drag/wheel (issue #522).
+    // SGR garbage for every click/drag/wheel (issue #522). The paint gate
+    // is bypassed here: a deferred final frame would leave the terminal
+    // showing the pre-exit screen.
+    this.bypassPaintGate = true;
     try {
       this.renderNow();
     } catch (renderError) {
@@ -2953,6 +3013,10 @@ export default class Ink {
 
     // Cancel any pending throttled renders to prevent accessing freed Yoga nodes
     this.scheduleRender.cancel?.();
+    if (this.drainWakeArmed) {
+      this.options.stdout.off?.('drain', this.handleDrainWake);
+      this.drainWakeArmed = false;
+    }
     if (this.drainTimer !== null) {
       clearTimeout(this.drainTimer);
       this.drainTimer = null;

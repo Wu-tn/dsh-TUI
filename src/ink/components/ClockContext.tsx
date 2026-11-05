@@ -95,7 +95,17 @@ export function createClock(tickIntervalMs: number): Clock {
   return clock;
 }
 export const ClockContext = createContext<Clock | null>(null);
-const BLURRED_TICK_INTERVAL_MS = FRAME_INTERVAL_MS * 2;
+/**
+ * Animation cadence while the terminal is unfocused. Nobody is watching a
+ * blurred terminal, and every tick that paints is bytes pushed into a pty
+ * that may not be draining at all (a backgrounded VS Code window pauses the
+ * terminal): at the focused cadence a task left running in a hidden tab
+ * piled megabytes of animation frames into the write buffer. 200ms keeps
+ * the screen roughly live for an unfocused-but-visible window while cutting
+ * the background frame count ~12x; `FOCUS_IN` restores the full rate and
+ * paints immediately.
+ */
+const BLURRED_TICK_INTERVAL_MS = 200;
 
 /** Stable clock ownership; focus only changes its scheduling interval. */
 export function ClockProvider({ children }: React.PropsWithChildren) {
