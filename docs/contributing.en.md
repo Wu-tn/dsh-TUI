@@ -480,6 +480,7 @@ change, also run the closest focused script:
 | Theme loading, persistence, and runtime plugin seam | `node --import tsx/esm scripts/verify-themes.mjs`, `node --import tsx/esm scripts/verify-runtime-themes.ts` |
 | Default-reasoning-effort and similar preference chains (effortPrefs / settings defaults) | `node --import tsx/esm scripts/verify-effort-default.ts` |
 | Scrolling/sticky-bottom behavior | `node scripts/verify-scroll.mjs`, `node scripts/verify-resticky.mjs`, `node --import tsx/esm scripts/verify-post-shrink-anchor.tsx`, `node --import tsx/esm scripts/verify-scroll-fold-anchor.tsx`, `node --import tsx/esm scripts/verify-scroll-fold-anchor-mounted.tsx`, `node --import tsx/esm scripts/verify-scroll-anchor-invalidation.tsx`, `node --import tsx/esm scripts/verify-scroll-anchor-remeasurement.tsx` (also with `DSH_TEST_COLUMNS=60`), and the matching `repro-*` harness |
+| PTY output backpressure (frames stop while the terminal is not draining; content catches up on `drain`) | `node --import tsx/esm scripts/verify-output-backpressure.tsx` |
 | Long plan-review body (`exit_plan_mode` windowing + wheel) | `node --import tsx/esm scripts/verify-plan-review-scroll.tsx` |
 | Fullscreen copy-on-select | `node scripts/verify-copy-on-select.mjs` |
 | Component-level mouse drag protocol (target capture, bubbling, click/selection compatibility, interrupted-session cleanup) | `node --import tsx/esm scripts/verify-drag-protocol.tsx` |

@@ -274,6 +274,10 @@ const GROUPS = {
 // 的旧像素被物理搬移后偶发重复/错位。A/B 同轨迹断言终态画面一致。
     ["repro-user-drag-wheel-render", ['node', '--import', 'tsx/esm', 'scripts/repro-user-drag-wheel-render.tsx']],
     ["verify-shrink", ['node', 'scripts/verify-shrink.mjs']],
+// pty 输出背压：终端停止消费时（后台 VS Code 窗口会暂停 pty）帧必须停在
+// 上界内，drain 后补齐内容。没有这道闸门时输出无限堆进进程内存——现场表
+// 现为任务挂后台几分钟后切回，编辑器渲染进程要一次解析几十 MB ANSI。
+    ["verify-output-backpressure", ['node', '--import', 'tsx/esm', 'scripts/verify-output-backpressure.tsx']],
 // 高于视口的收缩必须记 anchoredPad：终端 scrollback 不随内容收缩，
 // 高度差公式会少算 1 行 → 上移在视口顶被钳制 → 整帧相对写入链低一行
 // （verify-trace-scene settle-gap flake 的确定性蒸馏，红绿验证过）。

@@ -117,6 +117,16 @@ Tool results are associated by `callId`, never guessed from array position.
 - **Differential output**: each frame writes only screen changes and uses
   capability detection to choose synchronized output, cursor, and Windows
   Terminal paths.
+- **Output backpressure**: a frame is not painted at all while stdout holds
+  more than `PTY_PAINT_GATE_BYTES` (256KiB) in flight, and one frame is
+  painted on `drain`. Without this, a terminal that stops consuming (a
+  backgrounded VS Code window pauses the pty) makes frames pile into this
+  process's memory without bound, and refocusing hands the editor's renderer
+  tens of MB of ANSI to parse in one go. Only intermediate frames are
+  dropped: the screen is a pure function of the tree, and `frontFrame` only
+  advances after a frame is actually written.
+- **Blur throttling**: while the terminal is unfocused the animation clock
+  drops from 16ms to 200ms and `FOCUS_IN` restores it immediately.
 - **Message virtualization**: off-screen rows use the last measured fixed-height
   placeholder and do not participate in the full layout subtree.
 - **Replay coalescing**: consecutive token chunks are merged during history
