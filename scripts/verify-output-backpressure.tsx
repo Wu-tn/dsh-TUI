@@ -22,7 +22,7 @@ process.env.FORCE_COLOR = '3'
 process.env.DSH_TUI_LANG = 'zh'
 process.env.DSH_TUI_PTY_PAINT_GATE_BYTES = '16384'
 
-const [{ PassThrough, Writable }, React, { Terminal: XTerm }, { render, AlternateScreen }, { Chat }, { QuestionStore }, { default: instances }, { settled, sleep }, { PTY_PAINT_GATE_BYTES }] = await Promise.all([
+const [{ PassThrough, Writable }, React, { Terminal: XTerm }, { render, AlternateScreen }, { Chat }, { QuestionStore }, { default: instances }, { settled, sleep }, { PTY_PAINT_GATE_BYTES, PTY_PAINT_GATE_MAX_DEFER_MS }] = await Promise.all([
   import('node:stream'),
   import('react'),
   import('@xterm/headless'),
@@ -161,19 +161,30 @@ while (Date.now() - t0 < 3000 && streaming.stdout.writableLength <= PTY_PAINT_GA
 const stalledBacklog = streaming.stdout.writableLength
 check('停滞期间在飞字节到达并停在上界', stalledBacklog >= PTY_PAINT_GATE_BYTES && stalledBacklog <= PTY_PAINT_GATE_BYTES + 8 * 1024, `writableLength=${(stalledBacklog / 1024).toFixed(0)}KB gate=${(PTY_PAINT_GATE_BYTES / 1024).toFixed(0)}KB`)
 
-// 越过闸门后继续猛推 1.5s：帧必须停掉，字节不再增长。
+// 越过闸门后继续猛推 1.2s：帧必须被节流到「每个 MAX_DEFER 窗口最多一帧」，
+// 且字节不再无界增长（关键：不能像闸门早期版本那样等到 drain 才画——那在
+// 会做流控的终端上就是「彻底卡住，过一会一次性冒出来」）。
 const framesAtGate = frames.length
 const backlogAtGate = stalledBacklog
+const GATE_WINDOW_MS = 1200
 const t1 = Date.now()
-while (Date.now() - t1 < 1500) {
+while (Date.now() - t1 < GATE_WINDOW_MS) {
   streaming.tail.text = `闸门后内容 ${Date.now() % 100000} `.repeat(12)
   streaming.notify()
-  await sleep(16) // 固定窗:pacing 闸门后继续按 60fps 推流，观察帧是否停掉
+  await sleep(16) // 固定窗:pacing 闸门后继续按 60fps 推流，观察帧节流
 }
 const framesAfterGate = frames.length - framesAtGate
 const backlogAfterGate = streaming.stdout.writableLength
-check('越过闸门后不再出帧', framesAfterGate <= 1, `frames=${framesAfterGate}`)
-check('越过闸门后在飞字节不再增长', backlogAfterGate <= backlogAtGate + 1024, `${(backlogAtGate / 1024).toFixed(0)}KB -> ${(backlogAfterGate / 1024).toFixed(0)}KB`)
+// 60fps 无节流 = 约 72 帧；闸门有效则应只剩每 120ms 一帧（≈10）。
+check('闸门把帧节流到 MAX_DEFER 节奏', framesAfterGate <= Math.ceil(GATE_WINDOW_MS / PTY_PAINT_GATE_MAX_DEFER_MS) + 3, `frames=${framesAfterGate} (无节流约 ${Math.ceil(GATE_WINDOW_MS / 16)} 帧)`)
+check('闸门仍在出帧（不会彻底卡死）', framesAfterGate >= 2, `frames=${framesAfterGate}`)
+check('闸门后帧间隔不小于 MAX_DEFER', (() => {
+  const at = frames.slice(framesAtGate)
+  if (at.length < 2) return true
+  const gaps = at.slice(1).map((t, i) => t - at[i])
+  return Math.min(...gaps) >= PTY_PAINT_GATE_MAX_DEFER_MS - 25
+})(), `minGap=${(() => { const at = frames.slice(framesAtGate); if (at.length < 2) return 'n/a'; return Math.min(...at.slice(1).map((t, i) => t - at[i])) })()}ms`)
+check('在飞字节仍然有界', backlogAfterGate <= backlogAtGate + 64 * 1024, `${(backlogAtGate / 1024).toFixed(0)}KB -> ${(backlogAfterGate / 1024).toFixed(0)}KB`)
 
 // ===================== 2. 恢复后补齐 =====================
 streaming.stdout.release()

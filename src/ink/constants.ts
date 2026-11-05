@@ -35,3 +35,18 @@ export const PTY_BACKLOG_BYTES = 8192
 export const PTY_PAINT_GATE_BYTES = Number(process.env.DSH_TUI_PTY_PAINT_GATE_BYTES) > 0
   ? Number(process.env.DSH_TUI_PTY_PAINT_GATE_BYTES)
   : 256 * 1024
+
+/**
+ * Hard cap (ms) on how long the paint gate may keep the screen frozen.
+ *
+ * The byte gate alone is wrong for a terminal that flow-controls: VS Code
+ * pauses reading a pty while its renderer is behind, so `writableLength` sits
+ * above the ceiling exactly when the user is watching. Freezing until `drain`
+ * turns a slow frame into a dead screen — keys and wheel events are processed
+ * but nothing repaints, and the whole backlog appears at once when the
+ * terminal catches up ("totally stuck, then it responds"). A bounded wait
+ * keeps the memory ceiling while guaranteeing a fresh frame within this
+ * window; at most one frame per window is added to a backlog, which is
+ * nothing next to the unbounded growth the gate exists to stop.
+ */
+export const PTY_PAINT_GATE_MAX_DEFER_MS = 120

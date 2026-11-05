@@ -15,7 +15,7 @@ import { format } from 'util';
 import { colorize } from './colorize.js';
 import App from './components/App.js';
 import type { CursorDeclaration, CursorDeclarationSetter } from './components/CursorDeclarationContext.js';
-import { FRAME_INTERVAL_MS, PTY_BACKLOG_BYTES, PTY_PAINT_GATE_BYTES } from './constants.js';
+import { FRAME_INTERVAL_MS, PTY_BACKLOG_BYTES, PTY_PAINT_GATE_BYTES, PTY_PAINT_GATE_MAX_DEFER_MS } from './constants.js';
 import * as dom from './dom.js';
 import { beginGeometryFrame, endGeometryFrame, GEOMETRY_TRACE_ENABLED, noteAuxNumber, noteFrameCause } from './geometry-trace.js';
 import { callWithUpdateOverflowGuard, installNestedUpdateOverflowProcessGuard } from './update-overflow-guard.js';
@@ -175,6 +175,9 @@ export default class Ink {
   // terminal actually holds.
   private paintDeferred = false;
   private drainWakeArmed = false;
+  /** When the current deferral streak began (0 = not deferring). */
+  private paintDeferredSince = 0;
+  private paintGateTimer: ReturnType<typeof setTimeout> | null = null;
   /** Frames dropped by the gate since process start (geometry-trace aux). */
   private backpressureDrops = 0;
   // Set while the exit funnel paints its final frame: the gate must never
@@ -769,6 +772,24 @@ export default class Ink {
     this.scheduleRender();
   };
 
+  /**
+   * Guarantee a painted frame within {@link PTY_PAINT_GATE_MAX_DEFER_MS} even
+   * when `drain` never arrives (a flow-controlling terminal can hold the pty
+   * paused far longer than a person will wait). Unlike the drain wake this is
+   * a deadline, not a retry loop: it fires once per deferral streak and the
+   * gate itself decides whether the next frame paints or defers.
+   */
+  private armPaintGateDeadline(): void {
+    if (this.paintGateTimer !== null) return;
+    const remaining = Math.max(0, PTY_PAINT_GATE_MAX_DEFER_MS - (performance.now() - this.paintDeferredSince));
+    this.paintGateTimer = setTimeout(() => {
+      this.paintGateTimer = null;
+      if (!this.paintDeferred || this.isUnmounted || this.isPaused) return;
+      this.paintDeferred = false;
+      this.scheduleRender();
+    }, remaining);
+  }
+
   onRender() {
     if (this.isUnmounted || this.isPaused) {
       return;
@@ -782,16 +803,30 @@ export default class Ink {
     if (!this.bypassPaintGate) {
       const inFlight = (this.options.stdout as { writableLength?: number }).writableLength;
       if (typeof inFlight === 'number' && inFlight > PTY_PAINT_GATE_BYTES) {
-        this.paintDeferred = true;
-        // Counted as aux, not as a frame cause: this frame never begins, so
-        // noteFrameCause would attribute it to the NEXT frame's trace and
-        // read as "that frame was dropped", which it was not.
-        this.backpressureDrops += 1;
-        noteAuxNumber('backpressureDrops', this.backpressureDrops);
-        this.armDrainWake();
-        return;
+        const now = performance.now();
+        if (this.paintDeferredSince === 0) this.paintDeferredSince = now;
+        // A terminal that flow-controls (VS Code pauses the pty while its
+        // renderer is behind) keeps `writableLength` high exactly while the
+        // user is watching. Waiting for `drain` there turns one slow frame
+        // into a dead screen: input is processed, nothing repaints, then the
+        // whole backlog appears at once. Cap the wait so a fresh frame lands
+        // within PTY_PAINT_GATE_MAX_DEFER_MS no matter what the terminal does.
+        if (now - this.paintDeferredSince < PTY_PAINT_GATE_MAX_DEFER_MS) {
+          this.paintDeferred = true;
+          // Counted as aux, not as a frame cause: this frame never begins, so
+          // noteFrameCause would attribute it to the NEXT frame's trace and
+          // read as "that frame was dropped", which it was not.
+          this.backpressureDrops += 1;
+          noteAuxNumber('backpressureDrops', this.backpressureDrops);
+          this.armDrainWake();
+          this.armPaintGateDeadline();
+          return;
+        }
+        // Deadline expired: paint this frame regardless of the backlog and
+        // let the streak restart on the next drop.
       }
     }
+    this.paintDeferredSince = 0;
     if (this.needsSurfaceRepaint) {
       this.needsSurfaceRepaint = false;
       if (this.altScreenActive) {
